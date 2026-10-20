@@ -510,6 +510,7 @@ def _check_dummy_hash_model_forward(
             return output, None, None, None, None, None
 
     model = SimpleNamespace(
+        parallel_config=vllm_config.parallel_config,
         use_mega_moe=False,
         use_sequence_parallel=False,
         fuse_mhc_all_reduce=False,

@@ -7,7 +7,9 @@ import numpy as np
 import pytest
 import torch
 
-from vllm.config import CUDAGraphMode
+from vllm.config import CUDAGraphMode, VllmConfig
+from vllm.forward_context import set_forward_context
+from vllm.model_executor.layers.fused_moe.router.fused_topk_router import fused_topk
 from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
 from vllm.v1.worker.gpu import cp_utils as gpu_cp_utils
 from vllm.v1.worker.gpu import pcp_manager as pcp_manager_module
@@ -48,6 +50,7 @@ def _make_capture_manager(block_table: torch.Tensor):
         num_kv_cache_groups=1,
         kernel_block_sizes=(2,),
         blocks_per_kv_block=(1,),
+        cp_interleave=1,
     )
     manager = PCPManager(
         pcp_world_size=2,
@@ -234,9 +237,10 @@ def test_dummy_draft_does_not_reuse_previous_graph_batch():
 
     manager.prepare_draft_prefill(dummy_batch, dummy_batch.input_ids)
 
-    assert (
-        manager.get_draft_input_buffers(manager.input_buffers) is manager.input_buffers
+    draft_inputs, _ = manager.get_draft_input_buffers(
+        manager.input_buffers, dummy_batch.num_tokens_after_padding
     )
+    assert draft_inputs is manager.input_buffers
 
 
 def test_capture_uses_pcp_persistent_inputs():
@@ -258,6 +262,39 @@ def test_capture_uses_pcp_persistent_inputs():
         actual = getattr(input_batch, name)
         torch.testing.assert_close(actual, getattr(dummy_batch, name))
         assert actual.data_ptr() == getattr(manager.input_buffers, name).data_ptr()
+
+
+def test_block_table_rebind_updates_interleave():
+    manager, block_tables = _make_capture_manager(torch.ones((4, 2), dtype=torch.int32))
+    final_block_tables = SimpleNamespace(**vars(block_tables))
+    final_block_tables.cp_interleave = 64
+
+    manager.set_block_tables(final_block_tables)
+
+    assert manager._block_tables is final_block_tables
+    assert manager.cp_interleave == 64
+
+
+@pytest.mark.parametrize("moe_gathers_tokens", [False, True])
+def test_profile_padding_matches_moe_gathered_rows(moe_gathers_tokens):
+    manager = PCPManager(
+        pcp_world_size=2,
+        pcp_rank=0,
+        device=torch.device("cpu"),
+        max_num_reqs=4,
+        max_num_tokens=8,
+        moe_gathers_tokens=moe_gathers_tokens,
+    )
+    batch = InputBatch.make_dummy(
+        2, 4, InputBuffers(4, 8, torch.device("cpu")), is_padding=False
+    )
+    batch.is_padding[3] = True
+
+    actual = manager.prepare_inputs_to_capture(batch)
+
+    repeats = 2 if moe_gathers_tokens else 1
+    torch.testing.assert_close(actual.is_padding, batch.is_padding.repeat(repeats))
+    assert actual.input_ids.shape == (4,)
 
 
 def test_dummy_context_updates_pcp_local_block_tables():
@@ -541,3 +578,51 @@ def test_partition_defers_dcp_metadata_to_post_partition_batch():
     )
     assert local_batch.dcp_local_seq_lens is not None
     assert torch.equal(local_batch.dcp_local_seq_lens.cpu(), expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs GPU kernels")
+def test_moe_padding_matches_uneven_pcp_prefill_all_gather(monkeypatch):
+    """Routing must skip every rank's padding after MoE gathers PCP tokens."""
+    monkeypatch.setenv("VLLM_MOE_SKIP_PADDING", "1")
+    device = torch.device("cuda:0")
+    local_masks, batch_masks = [], []
+    for pcp_rank in range(2):
+        manager = PCPManager(
+            pcp_world_size=2,
+            pcp_rank=pcp_rank,
+            device=device,
+            max_num_reqs=4,
+            max_num_tokens=8,
+            moe_gathers_tokens=True,
+        )
+        global_buffers = InputBuffers(4, 8, device)
+        global_batch = InputBatch.make_dummy(1, 7, global_buffers, is_padding=False)
+        global_batch.positions.copy_(torch.arange(7, device=device))
+        global_batch = replace(
+            global_batch,
+            prefill_len_np=np.array([7], dtype=np.int32),
+            is_prefilling_np=np.array([True]),
+            has_prefill=True,
+            decode_graph_eligible=False,
+        )
+        local_batch = manager.partition_batch(
+            global_batch,
+            BatchExecutionDescriptor(
+                cg_mode=CUDAGraphMode.NONE, num_tokens=4, num_reqs=None
+            ),
+        )
+        num_tokens = local_batch.num_tokens_after_padding
+        local_masks.append(manager.input_buffers.is_padding[:num_tokens].cpu())
+        batch_masks.append(local_batch.is_padding.clone())
+
+    # Seven tokens in four zigzag chunks give rank 0 three and rank 1 four.
+    assert [mask.logical_not().sum().item() for mask in local_masks] == [3, 4]
+    for batch_mask in batch_masks:
+        assert torch.equal(batch_mask.cpu(), torch.cat(local_masks))
+        num_tokens = batch_mask.numel()
+        hidden_states = torch.randn(num_tokens, 4, device=device)
+        router_logits = torch.randn(num_tokens, 8, device=device)
+        with set_forward_context(None, VllmConfig(), is_padding=batch_mask):
+            _, topk_ids, _ = fused_topk(hidden_states, router_logits, 2, False)
+        assert (topk_ids[~batch_mask] >= 0).all()
+        assert (topk_ids[batch_mask] == -1).all()
